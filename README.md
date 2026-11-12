@@ -138,7 +138,7 @@ git remote add origin git@github.com:<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
-`.gitignore` 已排除 `.DS_Store` 与历史构建副本 `dist/`（**不要部署 `dist/`，它是旧版本**）。
+`.gitignore` 已排除 `.DS_Store`。**仓库根目录即站点**，部署时不要上传任何历史构建副本（旧的 `dist/` 已删除）。
 
 ### 2. 开启 Pages
 
@@ -181,6 +181,12 @@ GestureBloom/
 │   ├── 02-peony/
 │   ├── 03-iris/
 │   └── 04-dahlia/
+├── assets/mediapipe/     本地化的手势识别运行时（≈17 MB，见第九节）
+│   ├── vision_bundle.js
+│   ├── hand_landmarker.task
+│   └── wasm/
+├── assets/fonts/
+│   └── inter-latin.woff2 自托管 Inter 拉丁子集（48 KB，替代 Google Fonts）
 ├── serve.py              本地预览服务器（no-cache，127.0.0.1:8801）
 ├── 启动.command           macOS 双击启动
 ├── CNAME                 GitHub Pages 自定义域名
@@ -246,7 +252,7 @@ const SWIPE_REARM_MS = 220;  // 触发后停稳多久才接受下一次 ms
 
 - 过渡时长：`js/stage.js` 的 `TRANS_MS`（默认 760）。
 - 自动播放时长：`js/main.js` 中 `dur = 2600`。
-- 模型与 WASM 地址：`js/gesture.js` 的 `MODEL_URL` / `WASM_PATH`。若 `storage.googleapis.com` 在你的网络不可达，把 `hand_landmarker.task` 下载到仓库（如 `assets/hand_landmarker.task`）并改 `MODEL_URL` 指向它。
+- 模型与 WASM 地址：`js/gesture.js` 的 `LOCAL_BASE` / `WASM_PATH` / `MODEL_URL`。默认指向本地 `assets/mediapipe/`，取不到时自动回退 CDN 常量（`CDN_WASM_PATH` / `CDN_MODEL_URL`）。
 
 ---
 
@@ -278,8 +284,84 @@ const SWIPE_REARM_MS = 220;  // 触发后停稳多久才接受下一次 ms
 
 | 依赖 | 用途 | 许可 |
 |---|---|---|
-| [MediaPipe Tasks Vision](https://github.com/google-ai-edge/mediapipe) 0.10.14（jsDelivr CDN） | 浏览器端手部关键点推理 | Apache-2.0 |
-| Hand Landmarker 模型（Google 模型仓库） | 21 关键点手部模型 | Apache-2.0 |
-| Inter / Noto Sans SC（Google Fonts） | 界面字体 | SIL OFL |
+| [MediaPipe Tasks Vision](https://github.com/google-ai-edge/mediapipe) 0.10.14（**已本地化**至 `assets/mediapipe/`） | 浏览器端手部关键点推理 | Apache-2.0 |
+| Hand Landmarker 模型（**已本地化**至 `assets/mediapipe/hand_landmarker.task`） | 21 关键点手部模型 | Apache-2.0 |
+| Inter（**已本地化**至 `assets/fonts/`，拉丁子集 48 KB） | 界面西文字体 | SIL OFL |
+| PingFang SC / 微软雅黑等系统字体 | 中文界面文字（不再加载 1 MB+ 的中文字体包） | 随系统 |
 
 花开序列帧素材版权归项目作者所有，转载 / 商用前请先联系作者确认。代码部分未附开源许可证，默认保留所有权利。
+
+### 本地化的 MediaPipe 资源
+
+手部识别运行时（≈17 MB）已放进仓库，不再依赖境外 CDN：
+
+```
+assets/mediapipe/
+├── vision_bundle.js          134 KB  MediaPipe Tasks Vision 的 ESM 包
+├── hand_landmarker.task      7.4 MB  21 关键点手部模型
+└── wasm/
+    ├── vision_wasm_internal.js / .wasm           SIMD 版
+    └── vision_wasm_nosimd_internal.js / .wasm     无 SIMD 兜底
+```
+
+`js/gesture.js` 的地址决策顺序是**本地优先**：先用 `HEAD` 探测本地文件，取不到才回退 CDN。因此断网、googleapis 不可达、或 CDN 被拦截时，手势功能依然可用。
+
+> 实测资源就绪耗时：本地 **0.03 s** vs 境外 CDN **6.4 s**（同一台机器、并发下载）。线上因为走自家 CDN（同一网络）、无跨境链路，收益比本地更明显；首次访问后浏览器还会缓存，第二次几乎瞬时。
+
+更新依赖版本时可这样替换（注意同步改 `js/gesture.js` 顶部的 `LOCAL_BASE` 与 CDN 常量）：
+
+```bash
+VER=0.10.14
+BASE=https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@$VER
+curl -sL -o assets/mediapipe/vision_bundle.js "$BASE/vision_bundle.mjs"
+for f in vision_wasm_internal vision_wasm_nosimd_internal; do
+  curl -sL -o assets/mediapipe/wasm/$f.js   "$BASE/wasm/$f.js"
+  curl -sL -o assets/mediapipe/wasm/$f.wasm "$BASE/wasm/$f.wasm"
+done
+curl -sL -o assets/mediapipe/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+```
+
+> ⚠️ 路径由 `new URL('assets/mediapipe', document.baseURI)` 在运行时算出，因此根域名部署（`example.com/`）和子路径部署（`xxx.github.io/Repo/`）都能正常工作。不要改回写死的 `'/assets/mediapipe'`——那样在子路径下会 404；而纯相对路径 `'assets/...'` 也不行，动态 `import()` 会把它当裸模块名，报 `Failed to resolve module specifier`。
+
+---
+
+## 十、启动时序
+
+摄像头与识别模型是两条**并行**链路，互不阻塞：
+
+| 阶段 | 说明 |
+|---|---|
+| ① 权限 + 出画面 | 立即请求 `getUserMedia()`，预览面板自动展开 |
+| ② 素材加载 | **只加载当前可见的那一幅花**（10 个帧请求），其余三幅在模型就绪后补 |
+| ③ 模型下载 | WASM 与 7.9 MB 模型**并行**下载，都就绪后才启动推理 |
+
+因此点完「允许」就能立刻看到自己的画面，不必等模型下载完（首版会等约 20 s）。
+
+模型改用 `modelAssetBuffer` 传字节而非 `modelAssetPath` 传路径，就是为了让它能和 WASM 初始化并行——旧写法要等 WASM 初始化完才开始下模型，两段串行。
+
+预览面板顶部的状态条会实时反映进度：
+
+| 状态 | 含义 |
+|---|---|
+| 正在开启摄像头… | 等待浏览器权限弹窗 |
+| 正在加载手势模型… | 摄像头已出画面，识别模型还在下载 |
+| 手势已就绪 | 可捏合控制花开、挥掌切换 |
+| 摄像头不可用 | 权限被拒或没有摄像头，已降级为键盘 / 滚轮 / 按钮 |
+
+### 首屏与网络请求
+
+优化后启动阶段的关键请求（实测）：
+
+| 项 | 数量 |
+|---|---|
+| 首屏帧素材 | **10 个**（旧版 40 个 / 459 KB） |
+| MediaPipe 资源 | 4 个（bundle、wasm js、wasm、模型） |
+| 字体 | 1 个（48 KB，同域） |
+| 外部域名请求 | **0**（仅本地资源缺失时才回退 CDN） |
+
+几个刻意的取舍：
+
+- **不引 Google Fonts**：`<head>` 里的外部样式表是渲染阻塞的，网络被墙时会一直白屏等超时。改为自托管 Inter 拉丁子集，中文走系统字体。
+- **场景懒加载**：`stage.load()` 只等当前场景的首帧；其余三幅由 `warmRest()` 在模型就绪后逐个补齐，切换时若还没加载会先拉首帧再过渡。
+- **不做每帧重绘的优化**：骨架 canvas 每帧重置尺寸实测仅 0.002 ms，背景重绘约 1.8 ms/帧，都在预算内，没有为它们增加复杂度。

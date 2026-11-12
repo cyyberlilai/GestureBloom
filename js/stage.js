@@ -38,7 +38,8 @@ class Scene {
     // manifest 只是加速用；拿不到（file:// 打开、路径变更、被拦）也要能靠默认值继续跑
     let m = null;
     try {
-      const res = await fetch(`${this.base}/manifest.json`, { cache: 'no-store' });
+      // 不加 cache:'no-store'：让浏览器正常缓存，二次访问不必重新请求
+      const res = await fetch(`${this.base}/manifest.json`);
       if (res.ok) m = await res.json();
     } catch (e) {
       console.warn('[stage] manifest 读取失败，使用默认参数', this.id, e);
@@ -179,13 +180,48 @@ class Stage {
     this.bg.height = this.bh;
   }
 
+  /**
+   * 首屏只加载「当前可见」这一个场景。
+   * 旧写法 Promise.all 把 4 个场景全部拉一遍（40 个请求 / 459KB），
+   * 而用户只看得到第 1 幅。其余场景在空闲时再补。
+   */
   async load() {
-    await Promise.all(this.scenes.map((s) => s.load().catch((e) => console.warn(e))));
-    this.aspect = this.scenes[0].aspect || 9 / 16;
-    this.imgW = this.scenes[0].imgW;
-    this.imgH = this.scenes[0].imgH;
+    const first = this.scene;
+    await first.load().catch((e) => console.warn(e));
+    this.aspect = first.aspect || 9 / 16;
+    this.imgW = first.imgW;
+    this.imgH = first.imgH;
     this.resize();
-    return this.scenes.every((s) => s.ready);
+    // 兜底：即使手势没启用，也在 3 秒后把其余场景补上
+    this.warmRest(3000);
+    return first.ready;
+  }
+
+  /**
+   * 补齐其余场景。
+   * 默认延后启动，避免和 17MB 的手势模型抢带宽；
+   * 模型就绪后 main.js 会立刻调用一次，把等待缩短。
+   */
+  warmRest(delay = 0) {
+    if (this._warmDone) return;
+    const rest = this.scenes.filter((s) => s !== this.scene && !s.count);
+    if (!rest.length) {
+      this._warmDone = true;
+      return;
+    }
+    clearTimeout(this._warmTimer);
+    this._warmTimer = setTimeout(() => {
+      this._warmDone = true;
+      // 逐个加载，中间留点间隔，别和正在播放的画面抢带宽
+      const step = () => {
+        const s = rest.shift();
+        if (!s) return;
+        s.load()
+          .catch(() => {})
+          .then(() => setTimeout(step, 400));
+      };
+      step();
+    }, delay);
   }
 
   /** 当前场景的开合度 0..1（切换过程中不接受更新） */
@@ -205,7 +241,21 @@ class Stage {
     if (this.trans || this.scenes.length < 2) return false;
     if (next === this.active || next < 0 || next >= this.scenes.length) return false;
 
+    // 这个场景还没加载过（首屏只加载了当前场景）：先拉首帧，到位后再切
+    if (!this.scenes[next].count) {
+      this.scenes[next]
+        .load()
+        .catch(() => {})
+        .then(() => this.startTransition(next));
+      return true;
+    }
+    return this.startTransition(next);
+  }
+
+  startTransition(next) {
+    if (this.trans || next === this.active) return false;
     const s = this.scenes[next];
+    if (!s.count) return false;
     s.current = 0;
     s.target = 0;
 

@@ -9,9 +9,25 @@
  *   3) 每只手各自校准 MIN/MAX，消掉个体差异
  */
 
-const WASM_PATH = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
-const MODEL_URL =
+/* ---- 资源地址 ----
+ * 默认走本地 assets/mediapipe/：首屏不再依赖境外 CDN，
+ * 断网 / googleapis 不可达也能用手势。
+ * 若本地文件缺失，自动回退到 CDN。
+ *
+ * 路径用 <base> 标签的运行时值拼出来，而不是写死的 '/assets/...'：
+ *   - 动态 import() 不接受裸模块名，必须是绝对 URL 或以 / 开头的路径；
+ *   - 但写死 '/' 会让部署到子路径（如 xxx.github.io/Repo/）时 404。
+ * 折中做法：从 document.baseURI 取「站点根到本页面」的目录前缀，
+ * 既能 import()，又能随部署路径自适应。
+ */
+const LOCAL_BASE = new URL('assets/mediapipe', document.baseURI).href.replace(/\/$/, '');
+const WASM_PATH = `${LOCAL_BASE}/wasm`;
+const MODEL_URL = `${LOCAL_BASE}/hand_landmarker.task`;
+
+const CDN_WASM_PATH = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const CDN_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const CDN_BUNDLE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
 
 const CONNECTIONS = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -37,18 +53,39 @@ const SWIPE_MIN_SPAN = 140;  // 采样至少要覆盖这么久，避免两帧抖
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
+/**
+ * 下载模型字节。
+ * 本地优先，取不到再退 CDN；拿到的是 Uint8Array，直接喂给 modelAssetBuffer，
+ * 这样就能和 WASM 初始化并行，不用等 wasm 就绪才开始下 7.9MB。
+ */
+async function fetchModelBytes() {
+  const urls = [MODEL_URL, CDN_MODEL_URL];
+  let lastErr;
+  for (const u of urls) {
+    try {
+      const res = await fetch(u);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return new Uint8Array(await res.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+      console.warn('[gesture] 模型下载失败', u, e);
+    }
+  }
+  throw lastErr || new Error('手部模型下载失败');
+}
+
 async function loadVision() {
-  const urls = [
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs',
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14?module',
-  ];
+  // 优先本地 bundle；本地失败才退 CDN
+  const urls = [`${LOCAL_BASE}/vision_bundle.js`, CDN_BUNDLE];
   let lastErr;
   for (const u of urls) {
     try {
       const m = await import(/* @vite-ignore */ u);
       if (m && m.HandLandmarker && m.FilesetResolver) return m;
+      lastErr = new Error('bundle 缺少 HandLandmarker / FilesetResolver');
     } catch (e) {
       lastErr = e;
+      console.warn('[gesture] bundle 加载失败', u, e);
     }
   }
   throw lastErr || new Error('MediaPipe 加载失败');
@@ -104,26 +141,116 @@ class GestureController {
     this.max = Number(localStorage.getItem('flora.pinchMax')) || 1.10;
     this.swipe = { hist: [], who: null, armed: true, last: 0, stillSince: 0 };
     this.calib = null;
+
+    // 摄像头与识别模型解耦后需要的状态
+    this.gen = 0;            // 每次 start/stop 递增，用来丢弃过期的异步回调
+    this.landmarker = null;
+    this.modelPromise = null; // 复用进行中的下载，避免重复拉取 17MB
+    this.modelActive = false;
+    this.rafId = 0;
   }
 
+  /**
+   * 启动拆成两条并行链路：
+   *   1) 摄像头：立即请求权限并出画面，给用户即时反馈
+   *   2) 识别模型：后台下载 WASM / 模型，就绪后才开始推理
+   * 旧版要等约 17MB 全部下载完才弹权限框，体感像卡死。
+   */
   async start() {
-    if (!this.landmarker) {
-      const { FilesetResolver, HandLandmarker } = await loadVision();
-      const vision = await FilesetResolver.forVisionTasks(WASM_PATH);
-      this.landmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+    const gen = ++this.gen;
+    this.running = true;
+    this.modelActive = false;
+
+    // 先发起模型下载（不 await），让它和权限弹窗 / 素材加载同时进行
+    const model = this.ensureModel();
+    model
+      .then(() => this.activateModel(gen))
+      .catch((e) => {
+        if (gen === this.gen && this.running) {
+          console.warn('[gesture] 识别模型加载失败', e);
+          this.onModelError?.(e);
+        }
+      });
+
+    try {
+      await this.openCamera(); // 摄像头失败会抛给调用方走降级
+    } catch (e) {
+      // 权限被拒 / 没有摄像头：停掉这一轮，模型下载继续在后台跑（下次复用缓存）
+      this.running = false;
+      this.gen++;
+      throw e;
+    }
+    if (gen !== this.gen || !this.running) return false;
+    this.onCameraReady?.();
+    return true;
+  }
+
+  /** 模型只下载一次；下载中再次 start 会复用同一个 Promise */
+  ensureModel() {
+    if (this.landmarker) return Promise.resolve(this.landmarker);
+    if (!this.modelPromise) {
+      this.modelPromise = this.createLandmarker()
+        .then((lm) => {
+          this.landmarker = lm;
+          this.modelPromise = null;
+          return lm;
+        })
+        .catch((e) => {
+          this.modelPromise = null; // 允许下次重试
+          throw e;
+        });
+    }
+    return this.modelPromise;
+  }
+
+  async createLandmarker() {
+    const { FilesetResolver, HandLandmarker } = await loadVision();
+
+    // 模型（7.9MB）与 WASM（9MB）并行下载。
+    // 旧写法是等 forVisionTasks 把 wasm 初始化完才去下模型，两段串行白等一整份模型的时间。
+    const modelBytes = fetchModelBytes();
+
+    let vision;
+    try {
+      vision = await FilesetResolver.forVisionTasks(WASM_PATH);
+    } catch (e) {
+      console.warn('[gesture] 本地 WASM 不可用，回退 CDN', e);
+      this.onModelState?.('cdn');
+      vision = await FilesetResolver.forVisionTasks(CDN_WASM_PATH);
+    }
+
+    const buffer = await modelBytes;
+    const make = (delegate, bytes) =>
+      HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetBuffer: bytes, delegate },
         runningMode: 'VIDEO',
         numHands: 2,
         minHandDetectionConfidence: 0.6,
         minHandPresenceConfidence: 0.6,
         minTrackingConfidence: 0.6,
       });
-    }
 
+    try {
+      return await make('GPU', buffer);
+    } catch (e) {
+      console.warn('[gesture] GPU 初始化失败，回退 CPU', e);
+      this.onModelState?.('cpu');
+      // buffer 可能已被上一次调用取走，复制一份再试
+      return await make('CPU', buffer.slice());
+    }
+  }
+
+  async openCamera() {
+    if (this.video.srcObject && this.video.srcObject.active) return;
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
       audio: false,
     });
+    // 等权限期间用户可能已经关掉了手势，别把轨道挂回去
+    if (!this.running) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
     this.video.srcObject = stream;
     // 某些环境 play() 可能长时间不 resolve，别把整个启动流程卡住
     await Promise.race([
@@ -138,13 +265,28 @@ class GestureController {
       });
     }
     this.aspect = (this.video.videoWidth || 640) / (this.video.videoHeight || 480);
-    this.running = true;
+  }
+
+  activateModel(gen) {
+    if (gen !== this.gen || !this.running || !this.landmarker || this.modelActive) return;
+    this.modelActive = true;
     this.setState('idle', '等待手部进入画面');
+    this.onModelReady?.();
+    cancelAnimationFrame(this.rafId);
+    this.lastT = -1;
     this.tick();
   }
 
+  /** 模型是否已经可以推理 */
+  get modelReady() {
+    return !!this.landmarker;
+  }
+
   stop() {
+    this.gen++;
     this.running = false;
+    this.modelActive = false;
+    cancelAnimationFrame(this.rafId);
     const s = this.video.srcObject;
     if (s) s.getTracks().forEach((t) => t.stop());
     this.video.srcObject = null;
@@ -161,7 +303,7 @@ class GestureController {
 
   /* -------- 主循环：推理与渲染同帧，避免骨架和花不同步 -------- */
   tick = () => {
-    if (!this.running) return;
+    if (!this.running || !this.landmarker) return;
     const v = this.video;
     if (v.readyState >= 2 && v.currentTime !== this.lastT) {
       this.lastT = v.currentTime;
@@ -173,7 +315,7 @@ class GestureController {
       }
       if (res) this.process(res);
     }
-    requestAnimationFrame(this.tick);
+    this.rafId = requestAnimationFrame(this.tick);
   };
 
   process(res) {

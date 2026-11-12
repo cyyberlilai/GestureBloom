@@ -11,9 +11,10 @@
 <meta property="og:url" content="https://gesturebloom.framesecond.uk/" />
 <meta name="theme-color" content="#FFFFFF" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23ffffff'/%3E%3Cg fill='%23e879ae'%3E%3Cellipse cx='32' cy='19' rx='8' ry='14'/%3E%3Cellipse cx='32' cy='19' rx='8' ry='14' transform='rotate(72 32 32)'/%3E%3Cellipse cx='32' cy='19' rx='8' ry='14' transform='rotate(144 32 32)'/%3E%3Cellipse cx='32' cy='19' rx='8' ry='14' transform='rotate(216 32 32)'/%3E%3Cellipse cx='32' cy='19' rx='8' ry='14' transform='rotate(288 32 32)'/%3E%3C/g%3E%3Ccircle cx='32' cy='32' r='6.5' fill='%23f2c230'/%3E%3C/svg%3E" />
-<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
-<meta http-equiv="Pragma" content="no-cache" />
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Noto+Sans+SC:wght@400&display=swap" rel="stylesheet">
+<!-- 字体自托管：不再引 Google Fonts（那条外链会阻塞首屏渲染） -->
+<link rel="preload" href="assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+<!-- 手势识别模块提前预热，省掉 JS 解析后才开始下载的串行等待 -->
+<link rel="modulepreload" href="assets/mediapipe/vision_bundle.js" />
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -66,6 +67,10 @@
     <video id="cam" playsinline muted autoplay></video>
     <canvas id="skeleton"></canvas>
     <span class="pct" id="pct">0%</span>
+    <div class="cam-state" id="camState" data-tone="wait">
+      <i class="cam-state-dot"></i>
+      <span class="cam-state-text">正在开启摄像头…</span>
+    </div>
   </div>
 </section>
 
@@ -76,8 +81,8 @@
 
 <div class="toast" id="toast"></div>
 
-<script src="js/gesture.js?v=4"></script>
-<script src="js/stage.js?v=4"></script>
-<script src="js/main.js?v=4"></script>
+<script src="js/gesture.js?v=6"></script>
+<script src="js/stage.js?v=6"></script>
+<script src="js/main.js?v=6"></script>
 </body>
 </html>
